@@ -1,25 +1,22 @@
 
 #pragma once
 
-#include <cmath>
+#include <cstdint>
 
 class DecayDistribution {
 public:
     static constexpr int kVoices = 7;
+    static constexpr int kSteps = 16;
 
     // ========================================================
     // CONFIGURATION
     // ========================================================
 
-    // Maximum reduction:
-    // 0.97 = decay can be reduced to 3% of baseline.
-    static constexpr float kMaxReduction = 0.97f;
-
-    // Width of the moving emphasis region.
-    static constexpr float kWidth = 3.0f;
-
-    // Minimum decay multiplier
-    static constexpr float kMinMultiplier = 0.03f;
+    // Minimum decay relative to baseline.
+    //
+    // 0.06 = shortest hits can have 6%
+    // of the baseline decay time.
+    static constexpr float kMinMultiplier = 0.06f;
 
     // ========================================================
     // UTILITIES
@@ -30,126 +27,126 @@ public:
     }
 
     // ========================================================
-    // EMPHASIS FUNCTION
+    // DETERMINISTIC STEP HASH
     // ========================================================
 
-    static float Emphasis(float voice, float centre) {
+    // Produces a repeatable pseudo-random value
+    // for each voice and step combination.
+    //
+    // No changing random values between loops.
 
-        const float distance =
-            fabsf(voice - centre);
+    static uint32_t Hash(int voice, int step) {
 
-        // Linear taper for stronger influence
-        // across neighbouring voices.
-        return Clamp(
-            1.f - distance / kWidth,
-            0.f,
-            1.f
-        );
+        uint32_t x =
+            0x5EED2026u ^
+            (uint32_t(voice + 1) * 0x9E3779B9u) ^
+            (uint32_t(step + 1) * 0x85EBCA6Bu);
+
+        x ^= x >> 16;
+        x *= 0x7FEB352Du;
+        x ^= x >> 15;
+        x *= 0x846CA68Bu;
+        x ^= x >> 16;
+
+        return x;
     }
 
     // ========================================================
-    // DECAY DISTRIBUTION
+    // DECAY VARIATION
     // ========================================================
 
-    // Slider range: -1 to +1
+    // voice: 0-6
+    // step:  0-15
+    // depth: 0-1
     //
-    // CENTRE (0):
-    // All voices share the baseline decay.
+    // DEPTH = 0:
+    // Every triggered step uses the baseline decay.
     //
-    // UP (+):
-    // Moving notch of SHORTER decay times.
-    // Voices outside the notch retain baseline.
+    // DEPTH = 1:
+    // Individual steps receive different decay times.
     //
-    // DOWN (-):
-    // Moving peak of LONGER decay times.
-    // Voices outside the peak become shorter.
+    // Each voice has an independent variation pattern.
     //
-    // The slider never increases decay beyond
-    // the baseline established by S31.
+    // The patterns are deterministic and repeatable.
+    //
+    // No decay can exceed the baseline set by S31.
 
-    static void Calculate(
-        float slider,
-        float* output
+    static float Calculate(
+        int voice,
+        int step,
+        float depth
     ) {
 
-        slider = Clamp(slider, -1.f, 1.f);
+        depth = Clamp(depth, 0.f, 1.f);
 
         // ----------------------------------------------------
-        // DEPTH
+        // NO MODULATION
         // ----------------------------------------------------
 
-        const float depth =
-            fabsf(slider);
+        if(depth <= 0.f)
+            return 1.f;
 
         // ----------------------------------------------------
-        // CENTRE / NEUTRAL
+        // VALIDATE INPUTS
         // ----------------------------------------------------
 
-        if(depth < 0.001f) {
+        if(voice < 0 || voice >= kVoices)
+            return 1.f;
 
-            for(int i = 0; i < kVoices; ++i) {
-                output[i] = 1.f;
-            }
+        if(step < 0)
+            return 1.f;
 
-            return;
-        }
-
-        // ----------------------------------------------------
-        // MOVING EMPHASIS POSITION
-        // ----------------------------------------------------
-
-        // As the slider moves away from centre,
-        // emphasis travels from Band 1 to Band 7.
-        const float centre =
-            6.f * depth;
+        step %= kSteps;
 
         // ----------------------------------------------------
-        // CALCULATE VOICE WEIGHTS
+        // PRESERVED ACCENTS
         // ----------------------------------------------------
 
-        for(int i = 0; i < kVoices; ++i) {
+        // Each voice retains one full-length decay
+        // every four steps.
+        //
+        // Accent positions differ between voices.
 
-            const float emphasis =
-                Emphasis(
-                    float(i),
-                    centre
-                );
+        const int accentStep =
+            (voice * 3) % 4;
 
-            float reduction = 0.f;
+        if(step % 4 == accentStep)
+            return 1.f;
 
-            // ------------------------------------------------
-            // UP: SHORT-DECAY NOTCH
-            // ------------------------------------------------
+        // ----------------------------------------------------
+        // STEP VARIATION
+        // ----------------------------------------------------
 
-            if(slider > 0.f) {
+        const uint32_t hash =
+            Hash(voice, step);
 
-                reduction =
-                    kMaxReduction *
-                    depth *
-                    emphasis;
-            }
+        const float randomValue =
+            float(hash & 0xFFFFu) / 65535.f;
 
-            // ------------------------------------------------
-            // DOWN: LONG-DECAY PEAK
-            // ------------------------------------------------
+        // Squared distribution creates more
+        // pronounced differences in decay.
+        const float shaped =
+            randomValue * randomValue;
 
-            else {
+        // Minimum possible multiplier is 0.06
+        // at maximum modulation depth.
+        const float minimum =
+            kMinMultiplier +
+            (1.f - kMinMultiplier) * shaped;
 
-                reduction =
-                    kMaxReduction *
-                    depth *
-                    (1.f - emphasis);
-            }
+        // ----------------------------------------------------
+        // DEPTH CONTROL
+        // ----------------------------------------------------
 
-            // ------------------------------------------------
-            // FINAL DECAY MULTIPLIER
-            // ------------------------------------------------
+        // Interpolate from uniform decay
+        // toward the step's individual multiplier.
+        const float multiplier =
+            1.f + depth * (minimum - 1.f);
 
-            output[i] = Clamp(
-                1.f - reduction,
-                kMinMultiplier,
-                1.f
-            );
-        }
+        return Clamp(
+            multiplier,
+            kMinMultiplier,
+            1.f
+        );
     }
 };

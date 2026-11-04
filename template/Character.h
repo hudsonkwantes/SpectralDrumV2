@@ -1,20 +1,82 @@
 
 #pragma once
 
+#include "FrequencyDistribution.h"
 #include <cmath>
 
 class Character {
 public:
     static constexpr int kVoices = 7;
-
-    // Narrow spectral emphasis
-    static constexpr float kWidth = 1.7f;
+    static constexpr int kScenes = 6;
 
     struct Weights {
         float body = 0.f;
         float rattle = 0.f;
-        float shimmer = 0.f;
+        float crush = 0.f;
     };
+
+    struct Scene {
+        float body;
+        float rattle;
+        float crush;
+
+        float bodyHz;
+        float rattleHz;
+        float crushHz;
+    };
+
+    // ========================================================
+    // CHARACTER SCENES
+    // ========================================================
+
+    inline static constexpr Scene scenes[kScenes] = {
+
+        // CLEAN
+        {
+            0.f, 0.f, 0.f,
+            160.f, 1000.f, 3500.f
+        },
+
+        // BODY / WOOD
+        {
+            1.0f, 0.08f, 0.f,
+            135.f, 850.f, 3000.f
+        },
+
+        // RATTLE
+        {
+            0.25f, 1.0f, 0.08f,
+            200.f, 950.f, 3000.f
+        },
+
+        // INDUSTRIAL
+        {
+            0.10f, 0.65f, 0.75f,
+            300.f, 1400.f, 2800.f
+        },
+
+        // CRUSH
+        {
+            0.f, 0.15f, 1.0f,
+            250.f, 1800.f, 4800.f
+        },
+
+        // COMPLEX
+        {
+            0.65f, 0.75f, 0.90f,
+            180.f, 1100.f, 4000.f
+        }
+    };
+
+    // ========================================================
+    // CONFIGURATION
+    // ========================================================
+
+    static constexpr float kBodyWidth = 1.50f;
+    static constexpr float kRattleWidth = 1.25f;
+    static constexpr float kCrushWidth = 1.50f;
+
+    static constexpr int kMaxAffected = 3;
 
     Weights voices[kVoices]{};
 
@@ -28,25 +90,105 @@ public:
         return x < lo ? lo : (x > hi ? hi : x);
     }
 
+    static float Lerp(float a, float b, float t) {
+        return a + (b - a) * t;
+    }
+
+    static float LogLerp(float a, float b, float t) {
+        return expf(
+            Lerp(logf(a), logf(b), t)
+        );
+    }
+
     // ========================================================
-    // EMPHASIS
+    // SPECTRAL EMPHASIS
     // ========================================================
 
-    static float Emphasis(
-        float voice,
-        float centre
+    static float SpectralWeight(
+        float frequency,
+        float centre,
+        float width
     ) {
-        const float distance =
-            fabsf(voice - centre);
 
-        const float taper = Clamp(
-            1.f - distance / kWidth,
-            0.f,
-            1.f
+        frequency = Clamp(
+            frequency,
+            20.f,
+            18000.f
         );
 
-        // Narrow, smooth weighting
-        return taper * taper;
+        centre = Clamp(
+            centre,
+            20.f,
+            18000.f
+        );
+
+        const float octaveDistance =
+            log2f(frequency / centre);
+
+        const float normalized =
+            octaveDistance / width;
+
+        return expf(
+            -0.5f * normalized * normalized
+        );
+    }
+
+    // ========================================================
+    // NARROW DISTRIBUTION
+    // ========================================================
+
+    static void Isolate(float* weights) {
+
+        float original[kVoices];
+
+        for(int i = 0; i < kVoices; ++i)
+            original[i] = weights[i];
+
+        float maximum = 0.f;
+
+        for(int i = 0; i < kVoices; ++i) {
+
+            if(original[i] > maximum)
+                maximum = original[i];
+        }
+
+        if(maximum <= 0.f) {
+
+            for(int i = 0; i < kVoices; ++i)
+                weights[i] = 0.f;
+
+            return;
+        }
+
+        // Select three strongest voices
+        bool selected[kVoices]{};
+
+        for(int n = 0; n < kMaxAffected; ++n) {
+
+            int best = -1;
+            float bestValue = -1.f;
+
+            for(int i = 0; i < kVoices; ++i) {
+
+                if(!selected[i] &&
+                   original[i] > bestValue) {
+
+                    bestValue = original[i];
+                    best = i;
+                }
+            }
+
+            if(best >= 0)
+                selected[best] = true;
+        }
+
+        // Normalize selected weights
+        for(int i = 0; i < kVoices; ++i) {
+
+            weights[i] = selected[i]
+                ? original[i] / maximum
+                : 0.f;
+        }
     }
 
     // ========================================================
@@ -58,80 +200,139 @@ public:
     }
 
     // ========================================================
-    // UPDATE DISTRIBUTIONS
+    // UPDATE
     // ========================================================
 
-    void Update() {
+    void Update(float distributionPosition) {
 
-        const float x = position;
-
-        // Modulation depth reaches maximum
-        // relatively early in the knob rotation.
-        // The remaining travel moves the emphasis.
-        const float depth =
-            Clamp(x / 0.30f, 0.f, 1.f);
+        const float x =
+            Clamp(position, 0.f, 1.f);
 
         // ----------------------------------------------------
-        // CHARACTER POSITIONS
+        // CLEAN
         // ----------------------------------------------------
 
-        // BODY:
-        // Travels from high-numbered voices
-        // toward low-numbered voices.
+        if(x <= 0.f) {
+
+            for(auto& voice : voices)
+                voice = Weights{};
+
+            return;
+        }
+
+        // ----------------------------------------------------
+        // SCENE INTERPOLATION
+        // ----------------------------------------------------
+
+        const float scaled =
+            x * float(kScenes - 1);
+
+        int first = int(scaled);
+
+        if(first >= kScenes - 1)
+            first = kScenes - 2;
+
+        const int second = first + 1;
+
+        const float fraction =
+            scaled - float(first);
+
+        const float blend =
+            fraction * fraction *
+            (3.f - 2.f * fraction);
+
+        const Scene& a = scenes[first];
+        const Scene& b = scenes[second];
+
+        const float bodyDepth =
+            Lerp(a.body, b.body, blend);
+
+        const float rattleDepth =
+            Lerp(a.rattle, b.rattle, blend);
+
+        const float crushDepth =
+            Lerp(a.crush, b.crush, blend);
+
         const float bodyCentre =
-            6.f * (1.f - x);
+            LogLerp(a.bodyHz, b.bodyHz, blend);
 
-        // RATTLE:
-        // Moves outward and returns.
         const float rattleCentre =
-            6.f * fabsf(
-                sinf(3.14159265359f * x)
+            LogLerp(a.rattleHz, b.rattleHz, blend);
+
+        const float crushCentre =
+            LogLerp(a.crushHz, b.crushHz, blend);
+
+        // ----------------------------------------------------
+        // FREQUENCY DISTRIBUTION
+        // ----------------------------------------------------
+
+        float frequencies[kVoices];
+
+        FrequencyDistribution::Calculate(
+            distributionPosition,
+            frequencies
+        );
+
+        // ----------------------------------------------------
+        // RAW WEIGHTS
+        // ----------------------------------------------------
+
+        float body[kVoices];
+        float rattle[kVoices];
+        float crush[kVoices];
+
+        for(int i = 0; i < kVoices; ++i) {
+
+            body[i] = SpectralWeight(
+                frequencies[i],
+                bodyCentre,
+                kBodyWidth
             );
 
-        // SHIMMER:
-        // Travels from low-numbered voices
-        // toward high-numbered voices.
-        const float shimmerCentre =
-            6.f * x;
+            rattle[i] = SpectralWeight(
+                frequencies[i],
+                rattleCentre,
+                kRattleWidth
+            );
+
+            crush[i] = SpectralWeight(
+                frequencies[i],
+                crushCentre,
+                kCrushWidth
+            );
+        }
 
         // ----------------------------------------------------
-        // DISTRIBUTE CHARACTER
+        // ISOLATE EFFECT REGIONS
+        // ----------------------------------------------------
+
+        Isolate(body);
+        Isolate(rattle);
+        Isolate(crush);
+
+        // ----------------------------------------------------
+        // APPLY DEPTHS
         // ----------------------------------------------------
 
         for(int i = 0; i < kVoices; ++i) {
 
-            const float voice = float(i);
+            voices[i].body = Clamp(
+                bodyDepth * body[i],
+                0.f,
+                1.f
+            );
 
-            voices[i].body =
-                depth *
-                Emphasis(
-                    voice,
-                    bodyCentre
-                );
+            voices[i].rattle = Clamp(
+                rattleDepth * rattle[i],
+                0.f,
+                1.f
+            );
 
-            voices[i].rattle =
-                depth *
-                Emphasis(
-                    voice,
-                    rattleCentre
-                );
-
-            voices[i].shimmer =
-                depth *
-                Emphasis(
-                    voice,
-                    shimmerCentre
-                );
-        }
-
-        // Fully CCW means absolutely no modulation.
-        if(x <= 0.f) {
-
-            for(auto& v : voices) {
-                v.body = 0.f;
-                v.rattle = 0.f;
-                v.shimmer = 0.f;
-            }
+            voices[i].crush = Clamp(
+                crushDepth * crush[i],
+                0.f,
+                1.f
+            );
         }
     }
 

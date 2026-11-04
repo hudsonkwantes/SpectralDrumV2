@@ -1,15 +1,16 @@
-
 #pragma once
 
 #include "daisysp.h"
 #include "FrequencyDistribution.h"
 #include "DecayDistribution.h"
-#include "Shimmer.h"
+#include "Crush.h"
+
 #include <cstdint>
 #include <cmath>
 
 class ResonatorBank {
 public:
+
     static constexpr int kBands = 7;
 
     // ========================================================
@@ -18,24 +19,30 @@ public:
 
     static constexpr float kSampleRate = 48000.f;
 
+    // Fixed SVF resonance
     static constexpr float kResonance = 0.999f;
 
+    // Amplitude envelope
     static constexpr float kMinDecay = 0.03f;
-    static constexpr float kMaxDecay = 2.00f;
+    static constexpr float kMaxDecay = 3.00f;
+    static constexpr float kAttackTime = 0.002f;
 
-    static constexpr float kExcitationTime = 0.004f;
+    // Internal excitation
+    static constexpr float kExcitationTime = 0.001f;
 
-    // Original pitch envelope
-    static constexpr float kPitchSweepAmount = 1.5f;
-    static constexpr float kPitchTimeConstant = 0.017f;
+    // Body
+    static constexpr float kPitchSweepAmount = 1.2f;
+    static constexpr float kPitchTimeConstant = 0.01f;
+    static constexpr float kBodyDrive = 3.0f;
 
-    // Snare character
-    static constexpr float kSnareBurstTime = 0.11f;
-    static constexpr float kSnareHighpassHz = 700.f;
-    static constexpr float kSnareLevel = 0.25f;
+    // Rattle
+    static constexpr float kRattleBandwidth = 5000.f;
+    static constexpr float kRattleDepth = 1.60f;
 
+    // Frequency smoothing
     static constexpr float kFrequencySmooth = 0.025f;
 
+    // Output gain
     static constexpr float kMasterGain = 2.0f;
 
     static constexpr float kBandGain[kBands] = {
@@ -55,15 +62,25 @@ public:
     struct Band {
 
         daisysp::Svf filter;
-        Shimmer shimmer;
+        Crush crush;
 
+        // Frequency
         float frequency = 100.f;
         float targetFrequency = 100.f;
 
+        // Amplitude envelope
         float amplitude = 0.f;
         float decayCoefficient = 0.999f;
 
+        // Attack
+        float attackIncrement = 0.f;
+        uint32_t attackRemaining = 0;
+        float attackTarget = 1.f;
+
+        // Internal excitation
         float excitation = 0.f;
+
+        // Performance gate
         float gate = 0.f;
 
         // Body
@@ -74,12 +91,11 @@ public:
         // Rattle
         float noiseWeight = 0.f;
         float targetNoiseWeight = 0.f;
-        float noiseEnvelope = 0.f;
-        float noiseLowpass = 0.f;
+        float noiseModulation = 0.f;
 
-        // Shimmer
-        float shimmerWeight = 0.f;
-        float targetShimmerWeight = 0.f;
+        // Crush
+        float crushWeight = 0.f;
+        float targetCrushWeight = 0.f;
     };
 
     // ========================================================
@@ -90,11 +106,14 @@ public:
 
     float sampleRate = kSampleRate;
 
+    uint32_t attackSamples = 96;
+
     float excitationCoefficient = 0.f;
     float pitchCoefficient = 0.f;
+    float rattleFilterCoefficient = 0.f;
 
-    float snareBurstCoefficient = 0.f;
-    float snareHighpassCoefficient = 0.f;
+    float baselineDecay = 0.45f;
+    float stepDecayDepth = 0.f;
 
     uint32_t noiseState = 0xA341316Cu;
     uint32_t modulationCounter = 0;
@@ -128,6 +147,13 @@ public:
         noiseState = 0xA341316Cu;
         modulationCounter = 0;
 
+        attackSamples = uint32_t(
+            sampleRate * kAttackTime + 0.5f
+        );
+
+        if(attackSamples < 1)
+            attackSamples = 1;
+
         static constexpr float frequencies[kBands] = {
             65.f,
             110.f,
@@ -146,13 +172,20 @@ public:
             (sampleRate * kPitchTimeConstant)
         );
 
-        snareBurstCoefficient =
-            EnvelopeCoefficient(kSnareBurstTime);
-
-        snareHighpassCoefficient =
+        rattleFilterCoefficient =
             1.f - expf(
                 -2.f * 3.14159265359f *
-                kSnareHighpassHz / sampleRate
+                kRattleBandwidth / sampleRate
+            );
+
+        baselineDecay = 0.45f;
+        stepDecayDepth = 0.f;
+
+        const float initialSeconds =
+            kMinDecay *
+            powf(
+                kMaxDecay / kMinDecay,
+                baselineDecay
             );
 
         for(int i = 0; i < kBands; ++i) {
@@ -162,7 +195,7 @@ public:
             b.filter.Init(sampleRate);
             b.filter.SetRes(kResonance);
 
-            b.shimmer.Init(sampleRate);
+            b.crush.Init();
 
             b.frequency = frequencies[i];
             b.targetFrequency = frequencies[i];
@@ -170,6 +203,14 @@ public:
             b.filter.SetFreq(b.frequency);
 
             b.amplitude = 0.f;
+
+            b.decayCoefficient =
+                EnvelopeCoefficient(initialSeconds);
+
+            b.attackIncrement = 0.f;
+            b.attackRemaining = 0;
+            b.attackTarget = 1.f;
+
             b.excitation = 0.f;
             b.gate = 0.f;
 
@@ -179,14 +220,11 @@ public:
 
             b.noiseWeight = 0.f;
             b.targetNoiseWeight = 0.f;
-            b.noiseEnvelope = 0.f;
-            b.noiseLowpass = 0.f;
+            b.noiseModulation = 0.f;
 
-            b.shimmerWeight = 0.f;
-            b.targetShimmerWeight = 0.f;
+            b.crushWeight = 0.f;
+            b.targetCrushWeight = 0.f;
         }
-
-        SetDecay(0.45f, 0.f);
     }
 
     // ========================================================
@@ -213,32 +251,19 @@ public:
     // DECAY
     // ========================================================
 
-    void SetDecay(float baseline, float weight) {
+    void SetDecay(float baseline, float depth) {
 
-        baseline = Clamp(baseline, 0.f, 1.f);
-
-        const float baselineSeconds =
-            kMinDecay *
-            powf(
-                kMaxDecay / kMinDecay,
-                baseline
-            );
-
-        float multipliers[kBands];
-
-        DecayDistribution::Calculate(
-            weight,
-            multipliers
+        baselineDecay = Clamp(
+            baseline,
+            0.f,
+            1.f
         );
 
-        for(int i = 0; i < kBands; ++i) {
-
-            const float seconds =
-                baselineSeconds * multipliers[i];
-
-            bands[i].decayCoefficient =
-                EnvelopeCoefficient(seconds);
-        }
+        stepDecayDepth = Clamp(
+            depth,
+            0.f,
+            1.f
+        );
     }
 
     // ========================================================
@@ -263,12 +288,12 @@ public:
             Clamp(weight, 0.f, 1.f);
     }
 
-    void SetShimmerWeight(int voice, float weight) {
+    void SetCrushWeight(int voice, float weight) {
 
         if(voice < 0 || voice >= kBands)
             return;
 
-        bands[voice].targetShimmerWeight =
+        bands[voice].targetCrushWeight =
             Clamp(weight, 0.f, 1.f);
     }
 
@@ -279,7 +304,8 @@ public:
     void Excite(
         int index,
         float velocity,
-        float strength
+        float strength,
+        int step
     ) {
 
         if(index < 0 || index >= kBands)
@@ -293,10 +319,47 @@ public:
             1.f
         );
 
+        // ----------------------------------------------------
+        // PER-STEP DECAY
+        // ----------------------------------------------------
+
+        const float baselineSeconds =
+            kMinDecay *
+            powf(
+                kMaxDecay / kMinDecay,
+                baselineDecay
+            );
+
+        const float multiplier =
+            DecayDistribution::Calculate(
+                index,
+                step,
+                stepDecayDepth
+            );
+
+        const float seconds =
+            baselineSeconds * multiplier;
+
+        b.decayCoefficient =
+            EnvelopeCoefficient(seconds);
+
+        // ----------------------------------------------------
+        // ATTACK
+        // ----------------------------------------------------
+
+        b.attackRemaining = attackSamples;
+        b.attackTarget = level;
+
+        b.attackIncrement =
+            (level - b.amplitude) /
+            float(attackSamples);
+
+        // ----------------------------------------------------
+        // RETRIGGER
+        // ----------------------------------------------------
+
         b.excitation = level;
-        b.amplitude = level;
         b.pitchEnvelope = 1.f;
-        b.noiseEnvelope = 1.f;
     }
 
     // ========================================================
@@ -317,9 +380,24 @@ public:
     // AUDIO PROCESSING
     // ========================================================
 
-    float Process(uint8_t audibleMask) {
+    float Process(
+        uint8_t audibleMask,
+        float fadeSeconds = 0.002f,
+        float externalAudio = 0.f,
+        float internalMix = 1.f
+    ) {
 
         float mix = 0.f;
+
+        // ----------------------------------------------------
+        // SOURCE MIX
+        // ----------------------------------------------------
+
+        const float internalGain =
+            Clamp(internalMix, 0.f, 1.f);
+
+        const float externalGain =
+            1.f - internalGain;
 
         const bool updateFrequency =
             (modulationCounter++ & 15u) == 0u;
@@ -338,11 +416,11 @@ public:
             b.noiseWeight += 0.002f *
                 (b.targetNoiseWeight - b.noiseWeight);
 
-            b.shimmerWeight += 0.002f *
-                (b.targetShimmerWeight - b.shimmerWeight);
+            b.crushWeight += 0.002f *
+                (b.targetCrushWeight - b.crushWeight);
 
             // ------------------------------------------------
-            // FREQUENCY + PITCH ENVELOPE
+            // FREQUENCY + BODY
             // ------------------------------------------------
 
             if(updateFrequency) {
@@ -364,6 +442,10 @@ public:
                 b.filter.SetFreq(frequency);
             }
 
+            // ------------------------------------------------
+            // BODY ENVELOPE
+            // ------------------------------------------------
+
             b.pitchEnvelope *= pitchCoefficient;
 
             if(b.pitchEnvelope < 0.0001f)
@@ -373,13 +455,31 @@ public:
             // INTERNAL EXCITATION
             // ------------------------------------------------
 
-            const float excitationSignal =
+            const float internalExcitation =
                 GenerateNoise() * b.excitation;
 
             b.excitation *= excitationCoefficient;
 
             if(b.excitation < 0.0001f)
                 b.excitation = 0.f;
+
+            // ------------------------------------------------
+            // EXTERNAL EXCITATION
+            // ------------------------------------------------
+
+            // Continuously receives external audio.
+            // Sequencer envelopes control audibility.
+
+            const float externalExcitation =
+                externalAudio;
+
+            // ------------------------------------------------
+            // INTERNAL / EXTERNAL CROSSFADE
+            // ------------------------------------------------
+
+            const float excitationSignal =
+                internalExcitation * internalGain +
+                externalExcitation * externalGain;
 
             // ------------------------------------------------
             // SVF BANDPASS
@@ -391,45 +491,91 @@ public:
                 b.filter.Band();
 
             // ------------------------------------------------
-            // RATTLE / SNARE
+            // BODY SOFT CLIPPING
             // ------------------------------------------------
 
-            const float whiteNoise =
+            const float bodyAmount = Clamp(
+                b.bodyWeight * b.pitchEnvelope,
+                0.f,
+                1.f
+            );
+
+            const float drive =
+                1.f + kBodyDrive * bodyAmount;
+
+            const float saturated =
+                tanhf(filtered * drive);
+
+            const float bodyProcessed =
+                filtered +
+                bodyAmount * (saturated - filtered);
+
+            // ------------------------------------------------
+            // RATTLE: NOISE AM
+            // ------------------------------------------------
+
+            const float rawNoise =
                 GenerateNoise();
 
-            b.noiseLowpass +=
-                snareHighpassCoefficient *
-                (whiteNoise - b.noiseLowpass);
+            b.noiseModulation +=
+                rattleFilterCoefficient *
+                (rawNoise - b.noiseModulation);
 
-            const float highpassedNoise =
-                whiteNoise - b.noiseLowpass;
-
-            const float noiseTexture =
-                highpassedNoise *
-                b.noiseEnvelope *
+            const float amGain = Clamp(
+                1.f +
                 b.noiseWeight *
-                kSnareLevel;
+                kRattleDepth *
+                b.noiseModulation,
+                0.f,
+                2.f
+            );
 
-            b.noiseEnvelope *= snareBurstCoefficient;
+            const float rattled =
+                bodyProcessed * amGain;
 
-            if(b.noiseEnvelope < 0.0001f)
-                b.noiseEnvelope = 0.f;
+            // ------------------------------------------------
+            // CRUSH: BIT + RATE REDUCTION
+            // ------------------------------------------------
+
+            const float transformed =
+                b.crush.Process(
+                    rattled,
+                    b.crushWeight
+                );
+
+            // ------------------------------------------------
+            // AMPLITUDE ATTACK + DECAY
+            // ------------------------------------------------
+
+            if(b.attackRemaining > 0) {
+
+                b.amplitude += b.attackIncrement;
+
+                --b.attackRemaining;
+
+                if(b.attackRemaining == 0)
+                    b.amplitude = b.attackTarget;
+            }
+            else {
+
+                b.amplitude *= b.decayCoefficient;
+            }
+
+            if(b.amplitude < 0.0001f &&
+               b.attackRemaining == 0) {
+
+                b.amplitude = 0.f;
+            }
 
             // ------------------------------------------------
             // SHARED AMPLITUDE ENVELOPE
             // ------------------------------------------------
 
-            const float dry =
-                (filtered + noiseTexture) *
-                b.amplitude;
-
-            b.amplitude *= b.decayCoefficient;
-
-            if(b.amplitude < 0.0001f)
-                b.amplitude = 0.f;
+            const float voice =
+                transformed * b.amplitude;
 
             // ------------------------------------------------
-            // PAD GATE
+            // PERFORMANCE GATE
             // ------------------------------------------------
 
             const float target =
@@ -437,8 +583,14 @@ public:
                     ? 1.f
                     : 0.f;
 
+            const float fadeTime = Clamp(
+                fadeSeconds,
+                0.002f,
+                3.f
+            );
+
             const float increment =
-                1.f / (sampleRate * 0.002f);
+                1.f / (sampleRate * fadeTime);
 
             b.gate += Clamp(
                 target - b.gate,
@@ -447,30 +599,12 @@ public:
             );
 
             // ------------------------------------------------
-            // SHIMMER
-            // ------------------------------------------------
-
-            // Feed the already enveloped and gated
-            // voice into the spatial effect.
-            const float gatedDry =
-                dry * b.gate;
-
-            const float shimmerWet =
-                b.shimmer.Process(
-                    gatedDry,
-                    b.shimmerWeight
-                );
-
-            // Shimmer tails are allowed to fade
-            // naturally after pad release.
-            const float voice =
-                gatedDry + shimmerWet;
-
-            // ------------------------------------------------
             // OUTPUT MIX
             // ------------------------------------------------
 
-            mix += voice * kBandGain[i];
+            mix += voice *
+                b.gate *
+                kBandGain[i];
         }
 
         // ====================================================
